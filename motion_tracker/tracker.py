@@ -445,3 +445,205 @@ class ORBTracker:
         self._last_track_time = None
         self._smoothed_center = None
         self._prev_raw_center = None
+
+
+class StarTracker:
+    """Tracks a bright spot on a dark background via intensity centroiding.
+
+    Designed for night-sky targets (stars, planets, satellites) where the
+    subject is a small, bright, near-featureless point source. ORB feature
+    matching is unsuitable there — point sources have no distinctive local
+    texture to describe or match. Instead this locates the bright blob near
+    the last known position and computes its intensity-weighted centroid
+    for sub-pixel accuracy.
+
+    Drop-in compatible with ORBTracker: exposes select_target(), track(),
+    reset(), the is_active/roi_size properties, and returns TrackResult.
+    The reported centre and (dx, dy) are smoothed with a One Euro filter,
+    identically to ORBTracker, so the downstream GUI / G-code path is
+    unchanged.
+    """
+
+    # Configuration
+    SEARCH_REGION_MULTIPLIER = 3.0    # search window = this * roi_size
+    MIN_BLOB_AREA = 2                 # pixels; reject single hot pixels
+    # Threshold = max(ABS_THRESHOLD, mean + THRESHOLD_SIGMA * std) within the
+    # search window. Adaptive so it copes with varying sky brightness.
+    THRESHOLD_SIGMA = 5.0
+    ABS_THRESHOLD = 40                # floor on the 0-255 grayscale
+
+    def __init__(self, roi_size=50):
+        # Point sources are compact; ROI capped at 50x50.
+        self._roi_size = min(int(roi_size), 50)
+        self._active = False
+
+        self._prev_center = None      # last raw measured centre (frame coords)
+        self._ref_intensity = None    # reference peak brightness (for status)
+
+        # Smoothing — same filter used by ORBTracker.
+        self._filter_x = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+        self._filter_y = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+        self._last_track_time = None
+        self._smoothed_center = None
+        self._prev_raw_center = None
+
+    @property
+    def is_active(self):
+        return self._active
+
+    @property
+    def roi_size(self):
+        return self._roi_size
+
+    # ------------------------------------------------------------------
+    # Detection helper
+    # ------------------------------------------------------------------
+
+    def _find_centroid(self, gray, x1, y1, x2, y2):
+        """Find the intensity-weighted centroid of the brightest blob in a
+        window of `gray` bounded by (x1,y1)-(x2,y2).
+
+        Returns (cx, cy, peak, area) in FRAME coordinates, or None if no
+        bright blob is present.
+        """
+        window = gray[y1:y2, x1:x2]
+        if window.size == 0:
+            return None
+
+        # Adaptive threshold: separate bright pixels from the dark sky.
+        mean = float(window.mean())
+        std = float(window.std())
+        thresh = max(self.ABS_THRESHOLD, mean + self.THRESHOLD_SIGMA * std)
+        _, mask = cv2.threshold(window, thresh, 255, cv2.THRESH_BINARY)
+        mask = mask.astype(np.uint8)
+
+        # Connected components — pick the brightest blob (highest peak).
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask, connectivity=8)
+        if num <= 1:
+            return None  # only background
+
+        best_label = -1
+        best_peak = -1.0
+        best_area = 0
+        for lbl in range(1, num):
+            area = int(stats[lbl, cv2.CC_STAT_AREA])
+            if area < self.MIN_BLOB_AREA:
+                continue
+            blob_vals = window[labels == lbl]
+            peak = float(blob_vals.max())
+            if peak > best_peak:
+                best_peak = peak
+                best_label = lbl
+                best_area = area
+        if best_label < 0:
+            return None
+
+        # Intensity-weighted centroid of the chosen blob (sub-pixel).
+        ys, xs = np.where(labels == best_label)
+        weights = window[ys, xs].astype(np.float64)
+        wsum = weights.sum()
+        if wsum <= 0:
+            return None
+        cx = float((xs * weights).sum() / wsum) + x1
+        cy = float((ys * weights).sum() / wsum) + y1
+        return cx, cy, best_peak, best_area
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def select_target(self, frame, center_x, center_y, roi_size=None):
+        """Lock onto the brightest spot near the click point."""
+        if roi_size is not None:
+            self._roi_size = min(int(roi_size), 50)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        half = self._roi_size // 2
+        x1 = max(0, int(center_x) - half)
+        y1 = max(0, int(center_y) - half)
+        x2 = min(w, int(center_x) + half)
+        y2 = min(h, int(center_y) + half)
+
+        found = self._find_centroid(gray, x1, y1, x2, y2)
+        if found is None:
+            logger.warning("No bright spot found near click for star tracking")
+            self._active = False
+            return False
+
+        cx, cy, peak, area = found
+        self._prev_center = (cx, cy)
+        self._ref_intensity = peak
+        self._active = True
+
+        # Prime smoothing from the initial centroid.
+        self._filter_x.reset()
+        self._filter_y.reset()
+        self._last_track_time = None
+        self._smoothed_center = (cx, cy)
+        self._prev_raw_center = (cx, cy)
+
+        logger.info(f"Star target locked at ({cx:.1f}, {cy:.1f}), "
+                    f"peak={peak:.0f}, area={area}px")
+        return True
+
+    def track(self, frame):
+        if not self._active:
+            return TrackResult(lost=True)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+
+        # Search window around the last known position.
+        search_half = int(self._roi_size * self.SEARCH_REGION_MULTIPLIER / 2)
+        px, py = self._prev_center
+        x1 = max(0, int(px) - search_half)
+        y1 = max(0, int(py) - search_half)
+        x2 = min(w, int(px) + search_half)
+        y2 = min(h, int(py) + search_half)
+
+        found = self._find_centroid(gray, x1, y1, x2, y2)
+        if found is None:
+            return TrackResult(lost=True, num_matches=0)
+
+        new_cx, new_cy, peak, area = found
+
+        # --- Smoothing (identical to ORBTracker) ---
+        now = time.monotonic()
+        dt = (now - self._last_track_time) if self._last_track_time else 0.0
+        self._last_track_time = now
+        sm_cx = self._filter_x(new_cx, dt)
+        sm_cy = self._filter_y(new_cy, dt)
+
+        if self._smoothed_center is not None:
+            dx = sm_cx - self._smoothed_center[0]
+            dy = sm_cy - self._smoothed_center[1]
+        else:
+            dx = dy = 0.0
+        self._smoothed_center = (sm_cx, sm_cy)
+        self._prev_center = (new_cx, new_cy)
+        self._prev_raw_center = (new_cx, new_cy)
+
+        # inlier_ratio/num_matches are repurposed for status display:
+        # report normalized brightness and blob area.
+        brightness = min(1.0, peak / 255.0)
+        return TrackResult(
+            dx=dx,
+            dy=dy,
+            center=(sm_cx, sm_cy),
+            corners=None,
+            lost=False,
+            inlier_ratio=brightness,
+            num_matches=int(area),
+        )
+
+    def reset(self):
+        self._active = False
+        self._prev_center = None
+        self._ref_intensity = None
+        self._filter_x.reset()
+        self._filter_y.reset()
+        self._last_track_time = None
+        self._smoothed_center = None
+        self._prev_raw_center = None

@@ -80,7 +80,7 @@ class GCodeSender:
 
     def __init__(self, mm_per_pixel=0.0125, feed_rate=500.0,
                  max_step_mm=5.0, min_step_mm=0.02, send_interval=0.05,
-                 deadband_px=3.0, idle_release_ms=0, invert_x=False,
+                 deadband_px=1.5, idle_release_ms=0, invert_x=False,
                  invert_y=True):
         self.mm_per_pixel = float(mm_per_pixel)
         self.feed_rate = float(feed_rate)

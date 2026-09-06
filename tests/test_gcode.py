@@ -135,6 +135,11 @@ class TestPixelDeadbandAndScale(unittest.TestCase):
         s = GCodeSender()
         self.assertEqual(s.idle_release_ms, 0)
 
+    def test_default_deadband_is_1_5(self):
+        # Sensitivity doubled for slow targets: deadband halved 3.0 -> 1.5.
+        s = GCodeSender()
+        self.assertEqual(s.deadband_px, 1.5)
+
     def test_release_steppers_clears_pending_and_requests_cancel(self):
         s = GCodeSender()
         s._pending_x = 3.0

@@ -5,7 +5,7 @@ import math
 from PIL import Image, ImageTk
 import logging
 
-from .tracker import ORBTracker, TrackResult
+from .tracker import ORBTracker, StarTracker, TrackResult
 from .gcode import GCodeSender, list_serial_ports
 
 logger = logging.getLogger(__name__)
@@ -54,11 +54,14 @@ class TrackerApp:
         self._camera_indices = []
         self._exposure_ms = 100
 
-        # Tracker
-        self._tracker = ORBTracker()
+        # Tracker — StarTracker for bright-spot-on-dark (night sky) targets.
+        self._tracker = StarTracker()
         # CNC / G-code output (motion disabled until user connects + enables)
         self._gcode = GCodeSender()
         self._was_lost = True
+        # Software exposure gain (2x = double brightness). Compensates for
+        # backends without hardware exposure control.
+        self._gain = 2.0
         self._current_frame = None   # raw BGR frame (full resolution)
         self._photo_image = None     # prevent GC
         self._display_scale = 1.0    # frame-pixel = display-pixel / scale
@@ -288,11 +291,20 @@ class TrackerApp:
             # time so display, click coordinates, and tracking all operate in
             # the same flipped orientation.
             frame = cv2.flip(frame, -1)
+            # Software exposure gain: hardware shutter control is unavailable
+            # on some backends (e.g. macOS AVFoundation), so brighten the
+            # frame in software to simulate a longer exposure. Applied before
+            # display and tracking so both benefit. Saturating multiply.
+            if self._gain != 1.0:
+                frame = cv2.convertScaleAbs(frame, alpha=self._gain, beta=0.0)
             self._current_frame = frame.copy()
             display = frame.copy()
             if self._tracker.is_active:
                 result = self._tracker.track(frame)
                 display = self._draw_tracking(display, result)
+                # Magnified ROI inset (upper-right quadrant, 10x zoom).
+                if not result.lost and result.center is not None:
+                    display = self._draw_roi_inset(display, result.center)
                 self._update_tracking_status(result)
                 # Forward smoothed motion to the CNC controller. The sender
                 # is a no-op unless connected and motion is enabled.
@@ -369,6 +381,51 @@ class TrackerApp:
             cv2.line(frame, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
             pos += step
 
+    def _draw_roi_inset(self, frame, center):
+        """Composite a 10x-magnified view of the ROI area into the upper-right
+        quadrant (1/4 of the frame).
+
+        The inset occupies half the frame width and half its height. The
+        source crop is (inset_w/10 x inset_h/10) pixels centred on the tracked
+        point, so it is magnified exactly 10x to fill the inset.
+        """
+        h, w = frame.shape[:2]
+        inset_w = w // 2
+        inset_h = h // 2
+        if inset_w < 20 or inset_h < 20:
+            return frame
+
+        zoom = 10
+        crop_w = max(4, inset_w // zoom)
+        crop_h = max(4, inset_h // zoom)
+
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        x1 = cx - crop_w // 2
+        y1 = cy - crop_h // 2
+        # Clamp the crop to frame bounds.
+        x1 = max(0, min(x1, w - crop_w))
+        y1 = max(0, min(y1, h - crop_h))
+        crop = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+        if crop.size == 0:
+            return frame
+
+        # Magnify. INTER_NEAREST keeps pixels crisp for point-source inspection.
+        mag = cv2.resize(crop, (inset_w, inset_h),
+                         interpolation=cv2.INTER_NEAREST)
+
+        # Crosshair at the inset centre (the tracked point).
+        mcx, mcy = inset_w // 2, inset_h // 2
+        cv2.line(mag, (mcx, 0), (mcx, inset_h - 1), (0, 255, 0), 1)
+        cv2.line(mag, (0, mcy), (inset_w - 1, mcy), (0, 255, 0), 1)
+
+        # Place in the upper-right quadrant and draw a border + label.
+        ox, oy = w - inset_w, 0
+        frame[oy:oy + inset_h, ox:ox + inset_w] = mag
+        cv2.rectangle(frame, (ox, oy), (w - 1, inset_h - 1), (0, 255, 0), 2)
+        cv2.putText(frame, "ROI 10x", (ox + 6, oy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+        return frame
+
     def _draw_tracking(self, frame, result):
         if result.lost:
             h, w = frame.shape[:2]
@@ -393,8 +450,8 @@ class TrackerApp:
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                         (0, 255, 0), 2, cv2.LINE_AA)
             cv2.putText(frame,
-                        f"matches: {result.num_matches}  "
-                        f"inliers: {result.inlier_ratio:.0%}",
+                        f"brightness: {result.inlier_ratio:.0%}  "
+                        f"area: {result.num_matches}px",
                         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 200, 200), 1, cv2.LINE_AA)
         return frame
@@ -402,14 +459,12 @@ class TrackerApp:
     def _update_tracking_status(self, result):
         if result.lost:
             self._status.set(
-                f"LOST (matches: {result.num_matches}, "
-                f"inliers: {result.inlier_ratio:.0%}) "
-                f"\u2014 Click to re-select")
+                "LOST \u2014 no bright spot in view. Click a star to re-select.")
         else:
             self._status.set(
-                f"Tracking: dx={result.dx:+.1f} dy={result.dy:+.1f}  |  "
-                f"matches: {result.num_matches}  "
-                f"inliers: {result.inlier_ratio:.0%}")
+                f"Tracking star: dx={result.dx:+.1f} dy={result.dy:+.1f}  |  "
+                f"brightness: {result.inlier_ratio:.0%}  "
+                f"area: {result.num_matches}px")
 
     # ------------------------------------------------------------------
     # Callbacks
