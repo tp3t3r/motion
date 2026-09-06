@@ -382,46 +382,45 @@ class TrackerApp:
             pos += step
 
     def _draw_roi_inset(self, frame, center):
-        """Composite a 10x-magnified view of the ROI area into the upper-right
-        quadrant (1/4 of the frame).
+        """Composite a 10x-magnified view of the ROI into the upper-right
+        corner.
 
-        The inset occupies half the frame width and half its height. The
-        source crop is (inset_w/10 x inset_h/10) pixels centred on the tracked
-        point, so it is magnified exactly 10x to fill the inset.
+        The inset shows exactly the ROI area (roi_size x roi_size) magnified
+        10x, so the inset is (10 * roi_size) on a side. The inset image is
+        brightened 4x relative to the displayed frame. No crosshair — just
+        the magnified view.
         """
         h, w = frame.shape[:2]
-        inset_w = w // 2
-        inset_h = h // 2
-        if inset_w < 20 or inset_h < 20:
-            return frame
-
+        roi = int(self._tracker.roi_size)
         zoom = 10
-        crop_w = max(4, inset_w // zoom)
-        crop_h = max(4, inset_h // zoom)
+        inset = roi * zoom  # e.g. 50px ROI -> 500px inset
+
+        # Don't let the inset exceed the frame.
+        inset = min(inset, min(h, w))
+        if inset < 20:
+            return frame
+        crop = inset // zoom  # source ROI size in frame pixels
 
         cx, cy = int(round(center[0])), int(round(center[1]))
-        x1 = cx - crop_w // 2
-        y1 = cy - crop_h // 2
+        x1 = cx - crop // 2
+        y1 = cy - crop // 2
         # Clamp the crop to frame bounds.
-        x1 = max(0, min(x1, w - crop_w))
-        y1 = max(0, min(y1, h - crop_h))
-        crop = frame[y1:y1 + crop_h, x1:x1 + crop_w]
-        if crop.size == 0:
+        x1 = max(0, min(x1, w - crop))
+        y1 = max(0, min(y1, h - crop))
+        src = frame[y1:y1 + crop, x1:x1 + crop]
+        if src.size == 0:
             return frame
 
-        # Magnify. INTER_NEAREST keeps pixels crisp for point-source inspection.
-        mag = cv2.resize(crop, (inset_w, inset_h),
-                         interpolation=cv2.INTER_NEAREST)
+        # Magnify (crisp pixels for point-source inspection).
+        mag = cv2.resize(src, (inset, inset), interpolation=cv2.INTER_NEAREST)
+        # Brighten 4x relative to the displayed frame (saturating).
+        mag = cv2.convertScaleAbs(mag, alpha=4.0, beta=0.0)
 
-        # Crosshair at the inset centre (the tracked point).
-        mcx, mcy = inset_w // 2, inset_h // 2
-        cv2.line(mag, (mcx, 0), (mcx, inset_h - 1), (0, 255, 0), 1)
-        cv2.line(mag, (0, mcy), (inset_w - 1, mcy), (0, 255, 0), 1)
-
-        # Place in the upper-right quadrant and draw a border + label.
-        ox, oy = w - inset_w, 0
-        frame[oy:oy + inset_h, ox:ox + inset_w] = mag
-        cv2.rectangle(frame, (ox, oy), (w - 1, inset_h - 1), (0, 255, 0), 2)
+        # Place in the upper-right corner with a border + label.
+        ox, oy = w - inset, 0
+        frame[oy:oy + inset, ox:ox + inset] = mag
+        cv2.rectangle(frame, (ox, oy), (ox + inset - 1, oy + inset - 1),
+                      (0, 255, 0), 2)
         cv2.putText(frame, "ROI 10x", (ox + 6, oy + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
         return frame
